@@ -1,0 +1,25 @@
+{
+  "name": "telegram-nft-mint-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot for minting pixel art NFTs with payment verification",
+  "main": "api/webhook.js",
+  "scripts": {
+    "dev": "vercel dev",
+    "deploy": "vercel deploy --prod"
+  },
+  "dependencies": {
+    "node-fetch": "^2.7.0",
+    "mongodb": "^6.3.0",
+    "cloudinary": "^1.41.0",
+    "ethers": "^6.9.0"
+  },
+  "devDependencies": {
+    "vercel": "^33.0.0"
+  },
+  "engines": {
+    "node": ">=18.x"
+  },
+  "keywords": ["telegram", "nft", "blockchain", "ethereum", "pixel-art"],
+  "author": "Your Name",
+  "license": "MIT"
+}
