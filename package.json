@@ -1,7 +1,7 @@
 {
-  "name": "telegram-nft-mint-bot",
-  "version": "1.0.0",
-  "description": "Telegram bot for minting pixel art NFTs with payment verification",
+  "name": "telegram-unified-nft-bot",
+  "version": "2.0.0",
+  "description": "Unified Telegram bot - Novita AI generation + NFT minting",
   "main": "api/webhook.js",
   "scripts": {
     "dev": "vercel dev",
@@ -15,11 +15,5 @@
   },
   "devDependencies": {
     "vercel": "^33.0.0"
-  },
-  "engines": {
-    "node": ">=18.x"
-  },
-  "keywords": ["telegram", "nft", "blockchain", "ethereum", "pixel-art"],
-  "author": "Your Name",
-  "license": "MIT"
+  }
 }
