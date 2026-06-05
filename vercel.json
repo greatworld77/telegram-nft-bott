@@ -1,0 +1,25 @@
+{
+  "version": 2,
+  "functions": {
+    "api/webhook.js": {
+      "maxDuration": 60
+    },
+    "api/metadata/[tokenId].js": {
+      "maxDuration": 10
+    }
+  },
+  "routes": [
+    {
+      "src": "/api/webhook",
+      "dest": "/api/webhook.js"
+    },
+    {
+      "src": "/api/metadata/(.*)\\.json",
+      "dest": "/api/metadata/[tokenId].js"
+    },
+    {
+      "src": "/(.*)",
+      "dest": "/api/metadata/[tokenId].js"
+    }
+  ]
+}
