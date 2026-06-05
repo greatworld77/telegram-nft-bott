@@ -1,5 +1,5 @@
-// api/webhook.js - Complete NFT Minting Telegram Bot
-// Version: 1.0.0 - Sepolia Testnet Ready
+// api/webhook.js - UNIFIED BOT (Novita AI + NFT Minting)
+// Version: 2.0.0 - Merged
 
 const fetch = require('node-fetch');
 const { MongoClient } = require('mongodb');
@@ -7,22 +7,22 @@ const cloudinary = require('cloudinary').v2;
 const { ethers } = require('ethers');
 
 // ==================== CONFIGURATION ====================
-// Cloudinary setup for image storage
+
+// Cloudinary setup
 cloudinary.config({
     cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
     api_key: process.env.CLOUDINARY_API_KEY,
     api_secret: process.env.CLOUDINARY_API_SECRET
 });
 
-// Contract ABI (only the functions we need)
+// Novita AI setup
+const NOVITA_API_KEY = process.env.NOVITA_API_KEY;
+
+// Contract ABI
 const CONTRACT_ABI = [
     "function mintNFT(address to, uint8 pixelLevel) external payable",
-    "function setMintPrice(uint256 newPrice) external",
-    "function withdraw() external",
     "function getMintPrice() external view returns (uint256)",
-    "function totalSupply() external view returns (uint256)",
-    "function ownerOf(uint256 tokenId) external view returns (address)",
-    "function pixelationLevel(uint256 tokenId) external view returns (uint8)"
+    "function totalSupply() external view returns (uint256)"
 ];
 
 // Network configuration
@@ -45,7 +45,6 @@ const NETWORKS = {
     }
 };
 
-// Get current network from environment variable
 const CURRENT_NETWORK = NETWORKS[process.env.BLOCKCHAIN_NETWORK || 'sepolia'];
 const YOUR_WALLET = process.env.YOUR_WALLET_ADDRESS;
 const CONTRACT_ADDRESS = process.env.NFT_CONTRACT_ADDRESS;
@@ -57,20 +56,20 @@ let client;
 let provider;
 let contractWithSigner;
 
+// User sessions (in-memory)
+const userSessions = {};
+
 // ==================== HELPER FUNCTIONS ====================
 
-// Connect to MongoDB
 async function connectDB() {
     if (!client) {
         client = new MongoClient(process.env.MONGODB_URI);
         await client.connect();
-        db = client.db('nft_bot');
-        console.log('✅ MongoDB connected');
+        db = client.db('unified_bot');
     }
     return db;
 }
 
-// Get blockchain provider
 function getProvider() {
     if (!provider) {
         provider = new ethers.JsonRpcProvider(CURRENT_NETWORK.rpcUrl);
@@ -78,22 +77,16 @@ function getProvider() {
     return provider;
 }
 
-// Get contract with signer (for minting)
 async function getContractWithSigner() {
     if (!contractWithSigner) {
         const provider = getProvider();
         const privateKey = process.env.BOT_WALLET_PRIVATE_KEY;
-        if (!privateKey) {
-            throw new Error('BOT_WALLET_PRIVATE_KEY not set');
-        }
         const wallet = new ethers.Wallet(privateKey, provider);
         contractWithSigner = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, wallet);
-        console.log('✅ Contract connected');
     }
     return contractWithSigner;
 }
 
-// Send Telegram message
 async function sendMessage(chatId, text, parseMode = 'Markdown') {
     const url = `https://api.telegram.org/bot${process.env.TELEGRAM_TOKEN}/sendMessage`;
     try {
@@ -111,7 +104,6 @@ async function sendMessage(chatId, text, parseMode = 'Markdown') {
     }
 }
 
-// Send photo message
 async function sendPhoto(chatId, photoUrl, caption = '') {
     const url = `https://api.telegram.org/bot${process.env.TELEGRAM_TOKEN}/sendPhoto`;
     try {
@@ -129,77 +121,120 @@ async function sendPhoto(chatId, photoUrl, caption = '') {
     }
 }
 
-// Verify payment on blockchain
+// ==================== NOVITA AI FUNCTIONS (FROM BOT #1) ====================
+
+async function generateImageWithNovita(prompt) {
+    if (!NOVITA_API_KEY) {
+        console.error('NOVITA_API_KEY is not set');
+        return null;
+    }
+    
+    const apiUrl = 'https://api.novita.ai/v3/async/txt2img';
+    
+    const requestBody = {
+        "extra": {
+            "response_image_type": "jpeg"
+        },
+        "request": {
+            "model_name": "sd_xl_base_1.0.safetensors",
+            "prompt": prompt,
+            "negative_prompt": "nsfw, ugly, bad face, blurry",
+            "width": 1024,
+            "height": 1024,
+            "image_num": 1,
+            "steps": 20,
+            "seed": -1,
+            "guidance_scale": 7.5
+        }
+    };
+    
+    try {
+        const createResponse = await fetch(apiUrl, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${NOVITA_API_KEY}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(requestBody)
+        });
+        
+        const createData = await createResponse.json();
+        
+        if (!createResponse.ok) {
+            console.error('Novita API Error:', createData);
+            return null;
+        }
+        
+        const taskId = createData.task_id;
+        if (!taskId) return null;
+        
+        // Poll for results
+        for (let i = 0; i < 30; i++) {
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            
+            const resultResponse = await fetch(
+                `https://api.novita.ai/v3/async/task-result?task_id=${taskId}`,
+                { headers: { 'Authorization': `Bearer ${NOVITA_API_KEY}` } }
+            );
+            
+            const resultData = await resultResponse.json();
+            
+            if (resultData.task?.status === 'TASK_STATUS_SUCCEED') {
+                if (resultData.images && resultData.images.length > 0) {
+                    return resultData.images[0].image_url;
+                }
+            }
+            
+            if (resultData.task?.status === 'TASK_STATUS_FAILED') {
+                return null;
+            }
+        }
+        
+        return null;
+    } catch (error) {
+        console.error('Novita AI Error:', error);
+        return null;
+    }
+}
+
+// ==================== NFT MINTING FUNCTIONS (FROM BOT #2) ====================
+
 async function verifyPaymentOnBlockchain(txHash, expectedAmount, recipientWallet) {
     const provider = getProvider();
     
     try {
-        console.log(`🔍 Verifying transaction: ${txHash}`);
-        
-        // Get transaction details
         const tx = await provider.getTransaction(txHash);
+        if (!tx) return { success: false, error: 'Transaction not found' };
         
-        if (!tx) {
-            console.log('❌ Transaction not found');
-            return { success: false, error: 'Transaction not found' };
-        }
-        
-        // Verify recipient is your wallet
         if (tx.to?.toLowerCase() !== recipientWallet.toLowerCase()) {
-            console.log('❌ Wrong recipient');
-            return { success: false, error: 'Wrong recipient address' };
+            return { success: false, error: 'Wrong recipient' };
         }
         
-        // Verify amount
         const sentAmount = parseFloat(ethers.formatEther(tx.value));
-        const expected = parseFloat(expectedAmount);
-        
-        if (sentAmount < expected) {
-            console.log(`❌ Wrong amount: sent ${sentAmount}, expected ${expected}`);
-            return { success: false, error: `Sent ${sentAmount} but expected ${expected}` };
+        if (sentAmount < parseFloat(expectedAmount)) {
+            return { success: false, error: `Sent ${sentAmount} but expected ${expectedAmount}` };
         }
         
-        // Wait for confirmation
-        console.log('⏳ Waiting for confirmation...');
         const receipt = await tx.wait(1);
-        
         if (receipt.status === 1) {
-            console.log('✅ Payment verified successfully');
-            return { 
-                success: true, 
-                from: tx.from,
-                amount: sentAmount,
-                blockNumber: receipt.blockNumber 
-            };
+            return { success: true, from: tx.from, amount: sentAmount };
         }
         
         return { success: false, error: 'Transaction failed' };
-        
     } catch (error) {
-        console.error('Verification error:', error);
         return { success: false, error: error.message };
     }
 }
 
-// Mint NFT to user
-async function mintNFTToUser(userWalletAddress, pixelLevel = 8) {
+async function mintNFTToUser(userWalletAddress, imageUrl, pixelLevel = 8) {
     try {
         const contract = await getContractWithSigner();
         const price = await contract.getMintPrice();
         
-        console.log(`🎨 Minting NFT to ${userWalletAddress} with pixel level ${pixelLevel}`);
-        
-        const tx = await contract.mintNFT(userWalletAddress, pixelLevel, {
-            value: price
-        });
-        
-        console.log(`📝 Transaction sent: ${tx.hash}`);
-        
-        // Wait for confirmation
+        const tx = await contract.mintNFT(userWalletAddress, pixelLevel, { value: price });
         const receipt = await tx.wait();
-        console.log(`✅ Minted! Block: ${receipt.blockNumber}`);
         
-        // Extract token ID from event
+        // Extract token ID
         const mintEvent = receipt.logs.find(log => {
             try {
                 return log.topics[0] === ethers.id("NFTMinted(address,uint256,uint8,uint256)");
@@ -208,10 +243,7 @@ async function mintNFTToUser(userWalletAddress, pixelLevel = 8) {
             }
         });
         
-        let tokenId = 'unknown';
-        if (mintEvent) {
-            tokenId = parseInt(mintEvent.topics[2]).toString();
-        }
+        const tokenId = mintEvent ? parseInt(mintEvent.topics[2]).toString() : 'unknown';
         
         return {
             success: true,
@@ -219,53 +251,33 @@ async function mintNFTToUser(userWalletAddress, pixelLevel = 8) {
             tokenId: tokenId,
             explorerUrl: `${CURRENT_NETWORK.explorerUrl}/tx/${receipt.hash}`
         };
-        
     } catch (error) {
-        console.error('Minting error:', error);
-        return {
-            success: false,
-            error: error.message
-        };
+        return { success: false, error: error.message };
     }
 }
 
-// Pixelate image using Cloudinary
-async function pixelateImage(imageUrl, pixelSize = 10) {
-    // Cloudinary pixelation: e_pixelate:size
-    const pixelatedUrl = imageUrl.replace('/upload/', `/upload/e_pixelate:${pixelSize}/`);
-    return pixelatedUrl;
-}
-
-// Download and upload image to Cloudinary
 async function uploadToCloudinary(imageUrl, userId) {
-    try {
-        const imageResponse = await fetch(imageUrl);
-        const imageBuffer = await imageResponse.buffer();
-        
-        const uploadResult = await new Promise((resolve, reject) => {
-            cloudinary.uploader.upload_stream(
-                { 
-                    folder: `nft_uploads/${userId}`,
-                    public_id: `${Date.now()}`
-                },
-                (error, result) => {
-                    if (error) reject(error);
-                    else resolve(result);
-                }
-            ).end(imageBuffer);
-        });
-        
-        return uploadResult.secure_url;
-    } catch (error) {
-        console.error('Cloudinary upload error:', error);
-        throw error;
-    }
+    const imageResponse = await fetch(imageUrl);
+    const imageBuffer = await imageResponse.buffer();
+    
+    const uploadResult = await new Promise((resolve, reject) => {
+        cloudinary.uploader.upload_stream(
+            { folder: `nft_uploads/${userId}` },
+            (error, result) => {
+                if (error) reject(error);
+                else resolve(result);
+            }
+        ).end(imageBuffer);
+    });
+    
+    return uploadResult.secure_url;
 }
 
-// ==================== MAIN WEBHOOK HANDLER ====================
+async function pixelateImage(imageUrl, pixelSize = 10) {
+    return imageUrl.replace('/upload/', `/upload/e_pixelate:${pixelSize}/`);
+}
 
-// In-memory user sessions (simple, no extra DB needed)
-const userSessions = {};
+// ==================== MAIN UNIFIED WEBHOOK ====================
 
 async function handleWebhook(req, res) {
     if (req.method !== 'POST') {
@@ -273,7 +285,6 @@ async function handleWebhook(req, res) {
     }
 
     const update = req.body;
-    
     if (!update.message) {
         res.status(200).send('OK');
         return;
@@ -283,31 +294,27 @@ async function handleWebhook(req, res) {
     const userId = update.message.from.id;
     const text = update.message.text;
     const photo = update.message.photo;
-    const username = update.message.from.username || 'User';
     
-    // Initialize session if new user
     if (!userSessions[userId]) {
         userSessions[userId] = { step: 'start' };
     }
     
-    console.log(`📨 Message from ${username} (${userId}): ${text || 'photo'}`);
+    // ==================== COMMANDS ====================
     
-    // ==================== COMMAND HANDLERS ====================
-    
-    // /start command
+    // /start command - Show both options
     if (text === '/start') {
-        userSessions[userId] = { step: 'awaiting_image' };
-        
-        await sendMessage(chatId, 
-            `🎨 **Welcome to Pixel NFT Minting Bot!**\n\n` +
-            `🤖 I turn your images into unique 8-bit pixel art NFTs.\n\n` +
-            `**How it works:**\n` +
-            `1️⃣ Send me any image\n` +
-            `2️⃣ I'll pixelate it and store it\n` +
-            `3️⃣ Pay ${NFT_PRICE} ${CURRENT_NETWORK.currencySymbol}\n` +
-            `4️⃣ Receive your NFT on blockchain!\n\n` +
-            `**Network:** ${CURRENT_NETWORK.name} ${CURRENT_NETWORK.isTestnet ? '(Testnet - Free to test)' : ''}\n\n` +
-            `📤 **Please send me your image now:**`
+        userSessions[userId] = { step: 'main_menu' };
+        await sendMessage(chatId,
+            `🎨 **Welcome to Unified NFT Bot!**\n\n` +
+            `Choose how you want to create your NFT:\n\n` +
+            `🤖 **Option 1: Generate with AI**\n` +
+            `Send: \`/generate a beautiful sunset\`\n` +
+            `(I'll use Novita AI to create art from your description)\n\n` +
+            `📸 **Option 2: Upload your image**\n` +
+            `Just send me any photo directly\n\n` +
+            `💰 **Price:** ${NFT_PRICE} ${CURRENT_NETWORK.currencySymbol}\n` +
+            `🌐 **Network:** ${CURRENT_NETWORK.name}\n\n` +
+            `Type /help to see all commands`
         );
         return;
     }
@@ -315,19 +322,17 @@ async function handleWebhook(req, res) {
     // /help command
     if (text === '/help') {
         await sendMessage(chatId,
-            `📖 **Help Guide**\n\n` +
-            `**Commands:**\n` +
-            `/start - Start minting process\n` +
+            `📖 **Commands**\n\n` +
+            `**AI Generation:**\n` +
+            `/generate [description] - Create image with AI\n` +
+            `/generateandmint [description] - Generate AND mint as NFT\n\n` +
+            `**NFT Minting:**\n` +
+            `/mint - Start NFT minting process\n` +
             `/status - Check your order status\n` +
-            `/price - Show current mint price\n` +
-            `/network - Show current blockchain network\n` +
-            `/help - Show this help\n\n` +
-            `**Minting Steps:**\n` +
-            `1. Send an image\n` +
-            `2. Send payment to the wallet address provided\n` +
-            `3. Send the transaction hash\n` +
-            `4. Get your NFT!\n\n` +
-            `**Need help?** Contact @support`
+            `/price - Show current price\n\n` +
+            `**Info:**\n` +
+            `/network - Show blockchain network\n` +
+            `/start - Main menu`
         );
         return;
     }
@@ -335,10 +340,8 @@ async function handleWebhook(req, res) {
     // /price command
     if (text === '/price') {
         await sendMessage(chatId,
-            `💰 **Current Price**\n\n` +
-            `• Amount: ${NFT_PRICE} ${CURRENT_NETWORK.currencySymbol}\n` +
-            `• Network: ${CURRENT_NETWORK.name}\n` +
-            `• Contract: \`${CONTRACT_ADDRESS?.substring(0, 10)}...\``
+            `💰 **Current Price:** ${NFT_PRICE} ${CURRENT_NETWORK.currencySymbol}\n` +
+            `🌐 **Network:** ${CURRENT_NETWORK.name}`
         );
         return;
     }
@@ -346,12 +349,10 @@ async function handleWebhook(req, res) {
     // /network command
     if (text === '/network') {
         await sendMessage(chatId,
-            `🌐 **Blockchain Network**\n\n` +
-            `• Name: ${CURRENT_NETWORK.name}\n` +
-            `• Chain ID: ${CURRENT_NETWORK.chainId}\n` +
-            `• Explorer: ${CURRENT_NETWORK.explorerUrl}\n` +
-            `• Type: ${CURRENT_NETWORK.isTestnet ? 'Testnet 🧪' : 'Mainnet 🔴'}\n\n` +
-            `${CURRENT_NETWORK.isTestnet ? '⚠️ Using testnet - no real money involved!' : '⚠️ Using mainnet - real transactions!'}`
+            `🌐 **Network:** ${CURRENT_NETWORK.name}\n` +
+            `🔗 **Explorer:** ${CURRENT_NETWORK.explorerUrl}\n` +
+            `💰 **Currency:** ${CURRENT_NETWORK.currencySymbol}\n` +
+            `${CURRENT_NETWORK.isTestnet ? '🧪 Testnet mode' : '🔴 Mainnet mode'}`
         );
         return;
     }
@@ -363,60 +364,169 @@ async function handleWebhook(req, res) {
         const userOrder = await orders.findOne({ userId: userId });
         
         if (!userOrder) {
-            await sendMessage(chatId, "📭 You haven't started any NFT minting yet. Send /start to begin!");
+            await sendMessage(chatId, "📭 No active orders. Send /start to create one!");
         } else {
-            let statusMessage = `📊 **Your NFT Status**\n\n`;
-            statusMessage += `• Order ID: \`${userOrder.orderId}\`\n`;
-            statusMessage += `• Status: **${userOrder.status}**\n`;
-            statusMessage += `• Image: [View](${userOrder.originalImageUrl})\n`;
-            
-            if (userOrder.paymentHash) {
-                statusMessage += `• Transaction: \`${userOrder.paymentHash.substring(0, 15)}...\`\n`;
-            }
-            
-            if (userOrder.tokenId) {
-                statusMessage += `• Token ID: ${userOrder.tokenId}\n`;
-                statusMessage += `• Explorer: [View](${CURRENT_NETWORK.explorerUrl}/token/${CONTRACT_ADDRESS}?a=${userOrder.tokenId})\n`;
-            }
-            
-            statusMessage += `\nCreated: ${new Date(userOrder.createdAt).toLocaleString()}`;
-            
-            await sendMessage(chatId, statusMessage);
+            await sendMessage(chatId,
+                `📊 **Your NFT Status**\n\n` +
+                `• Status: ${userOrder.status}\n` +
+                `• Order ID: \`${userOrder.orderId}\`\n` +
+                (userOrder.paymentHash ? `• Transaction: \`${userOrder.paymentHash.substring(0, 20)}...\`\n` : '') +
+                (userOrder.tokenId ? `• Token ID: ${userOrder.tokenId}` : '')
+            );
         }
         return;
     }
     
-    // ==================== STEP 1: HANDLE IMAGE UPLOAD ====================
+    // ==================== AI GENERATION (NOVITA) ====================
     
-    if (photo && userSessions[userId].step === 'awaiting_image') {
+    // /generate command - Just generate, no mint
+    if (text && text.startsWith('/generate') && !text.includes('andmint')) {
+        let prompt = text.replace('/generate', '').trim();
+        
+        if (!prompt) {
+            await sendMessage(chatId, "📝 Please provide a description!\n\nExample: `/generate a cyberpunk cat with neon lights`");
+            return;
+        }
+        
+        await sendMessage(chatId, "🎨 Generating your image with Novita AI... This may take 10-15 seconds.");
+        
+        const imageUrl = await generateImageWithNovita(prompt);
+        
+        if (imageUrl) {
+            await sendPhoto(chatId, imageUrl, 
+                `🖼️ **Generated for:** "${prompt}"\n\n` +
+                `To mint this as an NFT, reply with:\n` +
+                `/mintthis`
+            );
+            
+            // Store the generated image in session
+            userSessions[userId].generatedImage = imageUrl;
+            userSessions[userId].prompt = prompt;
+        } else {
+            await sendMessage(chatId, "❌ Failed to generate image. Please try again with a different prompt.");
+        }
+        return;
+    }
+    
+    // /generateandmint command - Generate AND mint as NFT
+    if (text && text.startsWith('/generateandmint')) {
+        let prompt = text.replace('/generateandmint', '').trim();
+        
+        if (!prompt) {
+            await sendMessage(chatId, "📝 Please provide a description!\n\nExample: `/generateandmint a pixel art dragon`");
+            return;
+        }
+        
+        await sendMessage(chatId, "🎨 Generating your image with Novita AI...");
+        
+        const imageUrl = await generateImageWithNovita(prompt);
+        
+        if (!imageUrl) {
+            await sendMessage(chatId, "❌ Failed to generate image. Please try again.");
+            return;
+        }
+        
+        await sendMessage(chatId, "✨ Image generated! Now pixelating for NFT...");
+        
+        // Pixelate the image
+        const pixelatedUrl = await pixelateImage(imageUrl);
+        
+        // Save to database
+        const dbConnection = await connectDB();
+        const orders = dbConnection.collection('orders');
+        const orderId = 'ORD_' + userId + '_' + Date.now();
+        
+        await orders.insertOne({
+            orderId: orderId,
+            userId: userId,
+            chatId: chatId,
+            prompt: prompt,
+            originalImageUrl: imageUrl,
+            pixelatedImageUrl: pixelatedUrl,
+            status: 'awaiting_payment',
+            createdAt: new Date(),
+            amount: NFT_PRICE,
+            source: 'novita_ai'
+        });
+        
+        userSessions[userId] = {
+            step: 'awaiting_payment',
+            orderId: orderId,
+            pixelatedUrl: pixelatedUrl
+        };
+        
+        await sendPhoto(chatId, pixelatedUrl, "🖼️ **Your pixelated NFT preview!**");
+        
+        await sendMessage(chatId,
+            `✅ **Ready for minting!**\n\n` +
+            `💳 Send **${NFT_PRICE} ${CURRENT_NETWORK.currencySymbol}** to:\n` +
+            `\`${YOUR_WALLET}\`\n\n` +
+            `📝 Then reply with your transaction hash (TxID)`
+        );
+        return;
+    }
+    
+    // /mintthis command - Mint the last generated image
+    if (text === '/mintthis') {
+        if (!userSessions[userId].generatedImage) {
+            await sendMessage(chatId, "❌ No generated image found. First use `/generate` to create an image.");
+            return;
+        }
+        
+        const imageUrl = userSessions[userId].generatedImage;
+        const pixelatedUrl = await pixelateImage(imageUrl);
+        
+        const dbConnection = await connectDB();
+        const orders = dbConnection.collection('orders');
+        const orderId = 'ORD_' + userId + '_' + Date.now();
+        
+        await orders.insertOne({
+            orderId: orderId,
+            userId: userId,
+            chatId: chatId,
+            originalImageUrl: imageUrl,
+            pixelatedImageUrl: pixelatedUrl,
+            status: 'awaiting_payment',
+            createdAt: new Date(),
+            amount: NFT_PRICE,
+            source: 'novita_ai'
+        });
+        
+        userSessions[userId] = {
+            step: 'awaiting_payment',
+            orderId: orderId,
+            pixelatedUrl: pixelatedUrl
+        };
+        
+        await sendPhoto(chatId, pixelatedUrl, "🖼️ **Your pixelated NFT preview!**");
+        
+        await sendMessage(chatId,
+            `💳 Send **${NFT_PRICE} ${CURRENT_NETWORK.currencySymbol}** to:\n` +
+            `\`${YOUR_WALLET}\`\n\n` +
+            `📝 Then reply with your transaction hash`
+        );
+        return;
+    }
+    
+    // ==================== IMAGE UPLOAD (FROM BOT #2) ====================
+    
+    if (photo && (!userSessions[userId].step || userSessions[userId].step === 'start' || userSessions[userId].step === 'main_menu')) {
         const largestPhoto = photo[photo.length - 1];
         const fileId = largestPhoto.file_id;
         
         await sendMessage(chatId, "📸 **Image received!** Processing...");
         
         try {
-            // Get file URL from Telegram
             const fileResponse = await fetch(
                 `https://api.telegram.org/bot${process.env.TELEGRAM_TOKEN}/getFile?file_id=${fileId}`
             );
             const fileData = await fileResponse.json();
-            
-            if (!fileData.ok) {
-                throw new Error('Failed to get file');
-            }
-            
             const filePath = fileData.result.file_path;
             const imageUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_TOKEN}/${filePath}`;
             
-            // Upload to Cloudinary
-            await sendMessage(chatId, "☁️ Uploading to cloud storage...");
             const cloudinaryUrl = await uploadToCloudinary(imageUrl, userId);
-            
-            // Pixelate the image
-            await sendMessage(chatId, "🎨 Creating pixel art version...");
             const pixelatedUrl = await pixelateImage(cloudinaryUrl);
             
-            // Save to database
             const dbConnection = await connectDB();
             const orders = dbConnection.collection('orders');
             const orderId = 'ORD_' + userId + '_' + Date.now();
@@ -425,223 +535,112 @@ async function handleWebhook(req, res) {
                 orderId: orderId,
                 userId: userId,
                 chatId: chatId,
-                username: username,
                 originalImageUrl: cloudinaryUrl,
                 pixelatedImageUrl: pixelatedUrl,
                 status: 'awaiting_payment',
                 createdAt: new Date(),
                 amount: NFT_PRICE,
-                network: CURRENT_NETWORK.name
+                source: 'user_upload'
             });
             
-            // Update session
             userSessions[userId] = {
                 step: 'awaiting_payment',
                 orderId: orderId,
-                imageUrl: cloudinaryUrl,
                 pixelatedUrl: pixelatedUrl
             };
             
-            // Show pixelated preview
-            await sendPhoto(chatId, pixelatedUrl, "🖼️ **Your pixelated NFT preview!**\n\n*This is what your NFT will look like.*");
+            await sendPhoto(chatId, pixelatedUrl, "🖼️ **Your pixelated NFT preview!**");
             
-            // Send payment instructions
             await sendMessage(chatId,
-                `✅ **Image processed successfully!**\n\n` +
-                `💳 **Payment Instructions**\n\n` +
-                `Send **${NFT_PRICE} ${CURRENT_NETWORK.currencySymbol}** to this wallet:\n\n` +
+                `✅ **Image processed!**\n\n` +
+                `💳 Send **${NFT_PRICE} ${CURRENT_NETWORK.currencySymbol}** to:\n` +
                 `\`${YOUR_WALLET}\`\n\n` +
-                `📝 **After sending payment:**\n` +
-                `Reply with your **transaction hash** (TxID)\n\n` +
-                `🔍 Example: \`0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb0\`\n\n` +
-                `⚠️ **Important:** Send from a Web3 wallet (MetaMask, Trust Wallet)\n` +
-                `Your NFT will be sent to the SAME wallet you pay from!`
+                `📝 Reply with your transaction hash`
             );
             
         } catch (error) {
-            console.error('Upload error:', error);
-            await sendMessage(chatId, 
-                `❌ **Failed to process image**\n\n` +
-                `Error: ${error.message}\n\n` +
-                `Please try again with a different image.`
-            );
+            await sendMessage(chatId, "❌ Failed to process image. Please try again.");
         }
         return;
     }
     
-    // ==================== STEP 2: HANDLE TRANSACTION HASH ====================
+    // ==================== PAYMENT VERIFICATION (FROM BOT #2) ====================
     
     if (userSessions[userId].step === 'awaiting_payment' && text && text.startsWith('0x') && text.length >= 60) {
         const transactionHash = text.trim();
         
-        await sendMessage(chatId, "🔍 **Verifying payment...** Please wait (10-20 seconds).");
+        await sendMessage(chatId, "🔍 Verifying payment...");
         
-        try {
+        const verification = await verifyPaymentOnBlockchain(transactionHash, NFT_PRICE, YOUR_WALLET);
+        
+        if (verification.success) {
             const dbConnection = await connectDB();
             const orders = dbConnection.collection('orders');
             
-            // Check if transaction hash was already used (prevents fraud)
-            const existingOrder = await orders.findOne({ paymentHash: transactionHash });
-            if (existingOrder) {
-                await sendMessage(chatId, 
-                    "⚠️ **This transaction hash has already been used!**\n\n" +
-                    "Please send a valid transaction hash for your payment."
-                );
-                return;
-            }
+            await orders.updateOne(
+                { orderId: userSessions[userId].orderId },
+                { 
+                    $set: { 
+                        paymentHash: transactionHash,
+                        payerWallet: verification.from,
+                        status: 'payment_verified',
+                        verifiedAt: new Date()
+                    }
+                }
+            );
             
-            // Find user's pending order
-            const userOrder = await orders.findOne({ 
-                userId: userId, 
-                status: 'awaiting_payment' 
-            });
+            await sendMessage(chatId, "✅ **Payment verified!** Minting your NFT...");
             
-            if (!userOrder) {
-                await sendMessage(chatId, 
-                    "❌ **No pending order found**\n\n" +
-                    "Please send /start to create a new NFT order."
-                );
-                return;
-            }
+            const mintResult = await mintNFTToUser(verification.from, userSessions[userId].pixelatedUrl);
             
-            // Verify payment on blockchain
-            const verification = await verifyPaymentOnBlockchain(transactionHash, NFT_PRICE, YOUR_WALLET);
-            
-            if (verification.success) {
-                // Update order with payment info
+            if (mintResult.success) {
                 await orders.updateOne(
-                    { orderId: userOrder.orderId },
+                    { orderId: userSessions[userId].orderId },
                     { 
                         $set: { 
-                            paymentHash: transactionHash,
-                            payerWallet: verification.from,
-                            paymentAmount: verification.amount,
-                            status: 'payment_verified',
-                            verifiedAt: new Date(),
-                            blockNumber: verification.blockNumber
+                            status: 'completed',
+                            tokenId: mintResult.tokenId,
+                            mintTransactionHash: mintResult.transactionHash
                         }
                     }
                 );
                 
-                await sendMessage(chatId, "✅ **Payment verified!** Now minting your NFT...");
-                
-                // Mint the NFT to user's wallet
-                const mintResult = await mintNFTToUser(verification.from, 8);
-                
-                if (mintResult.success) {
-                    // Update order with minting info
-                    await orders.updateOne(
-                        { orderId: userOrder.orderId },
-                        { 
-                            $set: { 
-                                status: 'completed',
-                                tokenId: mintResult.tokenId,
-                                mintTransactionHash: mintResult.transactionHash,
-                                completedAt: new Date()
-                            }
-                        }
-                    );
-                    
-                    // Send success message
-                    await sendMessage(chatId,
-                        `🎉 **NFT Minted Successfully!** 🎉\n\n` +
-                        `✨ Your pixel art NFT is now on the blockchain!\n\n` +
-                        `**Details:**\n` +
-                        `• Token ID: \`${mintResult.tokenId}\`\n` +
-                        `• Transaction: [View on Explorer](${mintResult.explorerUrl})\n` +
-                        `• Network: ${CURRENT_NETWORK.name}\n\n` +
-                        `🖼️ The NFT will appear in your wallet shortly.\n` +
-                        `You can view it on OpenSea once indexed.\n\n` +
-                        `Thank you for minting! 🚀`
-                    );
-                    
-                    // Send the final pixelated NFT image
-                    await sendPhoto(chatId, userOrder.pixelatedImageUrl, 
-                        `🎨 **Your Pixel NFT #${mintResult.tokenId}**\n\n` +
-                        `Thank you for minting! This 8-bit masterpiece is now yours forever.`
-                    );
-                    
-                    // Update session
-                    userSessions[userId].step = 'completed';
-                    
-                } else {
-                    // Minting failed - update status
-                    await orders.updateOne(
-                        { orderId: userOrder.orderId },
-                        { 
-                            $set: { 
-                                status: 'minting_failed',
-                                mintError: mintResult.error
-                            }
-                        }
-                    );
-                    
-                    await sendMessage(chatId,
-                        `⚠️ **Payment verified but minting failed**\n\n` +
-                        `Your payment was successful but there was an issue minting the NFT.\n\n` +
-                        `**Error:** ${mintResult.error}\n\n` +
-                        `Please contact support with your transaction hash:\n` +
-                        `\`${transactionHash}\`\n\n` +
-                        `We will resolve this shortly.`
-                    );
-                }
-                
-            } else {
                 await sendMessage(chatId,
-                    `❌ **Payment verification failed!**\n\n` +
-                    `Reason: ${verification.error}\n\n` +
-                    `**Possible causes:**\n` +
-                    `• Wrong amount sent (need ${NFT_PRICE} ${CURRENT_NETWORK.currencySymbol})\n` +
-                    `• Wrong wallet address\n` +
-                    `• Transaction not confirmed yet\n\n` +
-                    `Please check and send the correct transaction hash.\n\n` +
-                    `Need help? Send /help`
+                    `🎉 **NFT Minted Successfully!** 🎉\n\n` +
+                    `✨ Token ID: \`${mintResult.tokenId}\`\n` +
+                    `🔗 [View on Explorer](${mintResult.explorerUrl})\n\n` +
+                    `Thank you for minting! 🚀`
                 );
+                
+                userSessions[userId].step = 'completed';
+            } else {
+                await sendMessage(chatId, `❌ Minting failed: ${mintResult.error}`);
             }
-            
-        } catch (error) {
-            console.error('Payment processing error:', error);
-            await sendMessage(chatId, 
-                `❌ **Error processing payment**\n\n` +
-                `Something went wrong: ${error.message}\n\n` +
-                `Please try again or contact support.`
-            );
+        } else {
+            await sendMessage(chatId, `❌ Payment verification failed: ${verification.error}`);
         }
         return;
     }
     
-    // Invalid transaction hash format
-    if (userSessions[userId].step === 'awaiting_payment' && text && !text.startsWith('0x') && !text.startsWith('/')) {
-        await sendMessage(chatId,
-            `⚠️ **Invalid transaction hash**\n\n` +
-            `Transaction hashes must:\n` +
-            `• Start with \`0x\`\n` +
-            `• Be 66 characters long\n\n` +
-            `Example: \`0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb0\`\n\n` +
-            `Please send the correct transaction hash from your wallet.`
-        );
-        return;
-    }
-    
-    // Default response for unknown input
+    // Default response
     if (text && !text.startsWith('/')) {
-        await sendMessage(chatId, 
-            `🤔 **Unknown command**\n\n` +
-            `Send /start to mint an NFT\n` +
-            `Send /help to see all commands\n` +
-            `Send /status to check your order`
+        await sendMessage(chatId,
+            `🤔 Unknown command.\n\n` +
+            `• Generate AI art: /generate [description]\n` +
+            `• Generate and mint: /generateandmint [description]\n` +
+            `• Upload your image: Just send a photo\n` +
+            `• Help: /help`
         );
     }
     
     res.status(200).send('OK');
 }
 
-// ==================== EXPORT ====================
 module.exports = async (req, res) => {
     try {
         await handleWebhook(req, res);
     } catch (error) {
         console.error('Fatal error:', error);
-        res.status(200).send('OK'); // Always return 200 to Telegram
+        res.status(200).send('OK');
     }
 };
