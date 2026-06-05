@@ -16,10 +16,6 @@
     {
       "src": "/api/metadata/(.*)\\.json",
       "dest": "/api/metadata/[tokenId].js"
-    },
-    {
-      "src": "/(.*)",
-      "dest": "/api/metadata/[tokenId].js"
     }
   ]
 }
